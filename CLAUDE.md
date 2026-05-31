@@ -156,6 +156,24 @@ Whitelist (öffentlich ohne Login): Login-Seiten, Einzel-Posts (`p/*/*`), Collec
 
 ---
 
+## Kubernetes-Kontext
+
+**Namespace:** `pixelfed`  
+**Deployment:** `pixelfed` — 3 Container: `pixelfed`, `queue-worker`, `scheduler`  
+**Service:** `pixelfed` (Port 80 → 8080)  
+**Kubeconfig:** `~/.kube/config-ops` (Standard, eingeschränkte Rechte: kein `exec`, kein `get secrets`)  
+**Admin** (z.B. für `php artisan tinker`): `KUBECONFIG=~/.kube/config` — explizite Freigabe nötig
+
+Sichere Diagnose-Befehle (keine Secrets):
+```bash
+kubectl get pods -n pixelfed
+kubectl logs deployment/pixelfed -n pixelfed -c pixelfed --tail=50
+kubectl logs deployment/pixelfed -n pixelfed -c queue-worker --tail=50
+kubectl get events -n pixelfed --sort-by='.lastTimestamp'
+```
+
+---
+
 ## Arbeitsweise
 
 - **Konzept vor Implementierung:** Vor jeder Änderung zuerst ein Konzept vorstellen und auf
