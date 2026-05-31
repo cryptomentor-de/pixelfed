@@ -1,0 +1,275 @@
+name: Build Pixelfed Patch Image
+
+on:
+  push:
+    branches: ['patches/*']
+  workflow_dispatch:
+    inputs:
+      base_tag:
+        description: 'Base tag (leer = aus Branch-Name)'
+        required: false
+        default: ''
+      patch_tag:
+        description: 'Output patch tag (leer = auto-increment)'
+        required: false
+        default: ''
+
+jobs:
+  build:
+    runs-on: arc-runner-set-k8s
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout pixelfed fork
+        uses: actions/checkout@v4
+
+      - name: Determine tags
+        id: tags
+        env:
+          K8S_REPO_PAT: ${{ secrets.K8S_REPO_PAT }}
+        run: |
+          if [ -n "${{ github.event.inputs.base_tag }}" ] && [ -n "${{ github.event.inputs.patch_tag }}" ]; then
+            BASE_TAG="${{ github.event.inputs.base_tag }}"
+            PATCH_TAG="${{ github.event.inputs.patch_tag }}"
+          else
+            BRANCH="${{ github.ref_name }}"
+            if [[ "$BRANCH" != patches/* ]]; then
+              echo "::error::workflow_dispatch ohne explizite Inputs muss von einem patches/* Branch ausgeführt werden (aktuell: $BRANCH)"
+              exit 1
+            fi
+            BASE_TAG="${BRANCH#patches/}"
+
+            # Read current tag from k8s repo manifest
+            MANIFEST=$(curl -sf \
+              -H "Authorization: token ${K8S_REPO_PAT}" \
+              -H "Accept: application/vnd.github.raw" \
+              "https://api.github.com/repos/cryptomentor-de/k8s/contents/apps/pixelfed/03-pixelfed.yaml")
+            CURRENT_TAG=$(echo "$MANIFEST" | grep -o 'pixelfed:[v0-9p.-]*' | head -1 | cut -d: -f2)
+            MANIFEST_BASE=$(echo "$CURRENT_TAG" | sed 's/-p[0-9]*$//')
+
+            if [ "$BASE_TAG" != "$MANIFEST_BASE" ]; then
+              echo "::notice::Branch patches/${BASE_TAG} aber Manifest verwendet ${MANIFEST_BASE}."
+              echo "::notice::Ersten Build manuell starten: workflow_dispatch mit base_tag=${BASE_TAG} patch_tag=${BASE_TAG}-p1"
+              echo "skip=true" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+
+            N=$(echo "$CURRENT_TAG" | grep -o '[0-9]*$')
+            PATCH_TAG="${BASE_TAG}-p$((N + 1))"
+          fi
+          echo "skip=false" >> $GITHUB_OUTPUT
+          echo "base_tag=$BASE_TAG" >> $GITHUB_OUTPUT
+          echo "patch_tag=$PATCH_TAG" >> $GITHUB_OUTPUT
+          echo "Building: ${BASE_TAG} → ${PATCH_TAG}"
+
+      - name: Install kubectl
+        if: steps.tags.outputs.skip != 'true'
+        run: |
+          KUBECTL_VERSION=$(curl -Ls https://dl.k8s.io/release/stable.txt)
+          curl -Lo /tmp/kubectl \
+            "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          curl -Lo /tmp/kubectl.sha256 \
+            "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl.sha256"
+          echo "$(cat /tmp/kubectl.sha256)  /tmp/kubectl" | sha256sum --check
+          chmod +x /tmp/kubectl
+          mkdir -p ~/bin
+          mv /tmp/kubectl ~/bin/kubectl
+          echo "$HOME/bin" >> $GITHUB_PATH
+
+      - name: Create kaniko Job
+        if: steps.tags.outputs.skip != 'true'
+        id: kaniko
+        env:
+          SCW_SECRET_KEY: ${{ secrets.SCW_SECRET_KEY }}
+          K8S_REPO_PAT: ${{ secrets.K8S_REPO_PAT }}
+        run: |
+          JOB_NAME="kaniko-pixelfed-${{ github.run_id }}"
+          REGISTRY_SECRET="kaniko-registry-${{ github.run_id }}"
+          GIT_SECRET="kaniko-git-${{ github.run_id }}"
+          NAMESPACE="arc-runners"
+          BASE_TAG="${{ steps.tags.outputs.base_tag }}"
+          PATCH_TAG="${{ steps.tags.outputs.patch_tag }}"
+
+          # Write outputs first so cleanup always has the names even if this step fails later
+          echo "job_name=${JOB_NAME}" >> $GITHUB_OUTPUT
+          echo "registry_secret=${REGISTRY_SECRET}" >> $GITHUB_OUTPUT
+          echo "git_secret=${GIT_SECRET}" >> $GITHUB_OUTPUT
+          echo "namespace=${NAMESPACE}" >> $GITHUB_OUTPUT
+
+          # Registry auth secret
+          AUTH=$(printf '%s' "nologin:${SCW_SECRET_KEY}" | base64 | tr -d '\n')
+          CONFIG_FILE=$(mktemp)
+          printf '{"auths":{"rg.fr-par.scw.cloud":{"auth":"%s"}}}' "${AUTH}" \
+            > "${CONFIG_FILE}"
+          kubectl delete secret "${REGISTRY_SECRET}" -n "${NAMESPACE}" --ignore-not-found
+          kubectl create secret generic "${REGISTRY_SECRET}" \
+            --from-file=config.json="${CONFIG_FILE}" -n "${NAMESPACE}"
+          rm -f "${CONFIG_FILE}"
+
+          # Git PAT secret
+          PAT_FILE=$(mktemp)
+          printf '%s' "${K8S_REPO_PAT}" > "${PAT_FILE}"
+          kubectl delete secret "${GIT_SECRET}" -n "${NAMESPACE}" --ignore-not-found
+          kubectl create secret generic "${GIT_SECRET}" \
+            --from-file=token="${PAT_FILE}" -n "${NAMESPACE}"
+          rm -f "${PAT_FILE}"
+
+          # kaniko Job YAML written to temp file
+          # Note: \${GIT_TOKEN} is intentionally escaped so bash does not expand it here;
+          # it remains as ${GIT_TOKEN} in the YAML and is resolved by the container shell.
+          cat > /tmp/kaniko-job.yaml << EOF
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ${JOB_NAME}
+            namespace: ${NAMESPACE}
+          spec:
+            ttlSecondsAfterFinished: 600
+            backoffLimit: 0
+            template:
+              spec:
+                restartPolicy: Never
+                securityContext:
+                  runAsUser: 0
+                initContainers:
+                  - name: clone
+                    image: alpine/git:latest
+                    command:
+                      - /bin/sh
+                      - -c
+                      - |
+                        git config --global credential.helper store
+                        printf 'https://x-access-token:%s@github.com\n' "\${GIT_TOKEN}" > /root/.git-credentials
+                        git clone --depth=1 --branch patches/${BASE_TAG} https://github.com/cryptomentor-de/pixelfed.git /workspace
+                    env:
+                      - name: GIT_TOKEN
+                        valueFrom:
+                          secretKeyRef:
+                            name: ${GIT_SECRET}
+                            key: token
+                    volumeMounts:
+                      - name: workspace
+                        mountPath: /workspace
+                containers:
+                  - name: kaniko
+                    image: gcr.io/kaniko-project/executor:latest
+                    args:
+                      - --context=dir:///workspace
+                      - --dockerfile=docker/Dockerfile
+                      - --build-arg=BASE_TAG=${BASE_TAG}
+                      - --destination=rg.fr-par.scw.cloud/cryptomentor/pixelfed:${PATCH_TAG}
+                      - --cache=true
+                      - --cache-repo=rg.fr-par.scw.cloud/cryptomentor/kaniko-cache
+                    resources:
+                      requests:
+                        memory: "512Mi"
+                        cpu: "500m"
+                      limits:
+                        memory: "2Gi"
+                        cpu: "2000m"
+                    volumeMounts:
+                      - name: docker-config
+                        mountPath: /kaniko/.docker
+                      - name: workspace
+                        mountPath: /workspace
+                volumes:
+                  - name: workspace
+                    emptyDir: {}
+                  - name: docker-config
+                    secret:
+                      secretName: ${REGISTRY_SECRET}
+                      items:
+                        - key: config.json
+                          path: config.json
+          EOF
+          kubectl create -f /tmp/kaniko-job.yaml
+          rm -f /tmp/kaniko-job.yaml
+
+      - name: Wait for kaniko Job
+        if: steps.tags.outputs.skip != 'true'
+        run: |
+          JOB_NAME="${{ steps.kaniko.outputs.job_name }}"
+          NAMESPACE="${{ steps.kaniko.outputs.namespace }}"
+          echo "Waiting for Job ${JOB_NAME} (max 10 min)..."
+
+          for i in $(seq 1 60); do
+            COMPLETE=$(kubectl get job "${JOB_NAME}" -n "${NAMESPACE}" \
+              -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null)
+            FAILED=$(kubectl get job "${JOB_NAME}" -n "${NAMESPACE}" \
+              -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null)
+
+            if [ "${COMPLETE}" = "True" ]; then
+              echo "Build succeeded"
+              break
+            elif [ "${FAILED}" = "True" ]; then
+              echo "::error::kaniko build failed"
+              exit 1
+            fi
+
+            echo "  [${i}/60] running..."
+            sleep 10
+
+            if [ "${i}" -eq 60 ]; then
+              echo "::error::Build timed out after 10 minutes"
+              exit 1
+            fi
+          done
+
+      - name: Stream build logs
+        if: always()
+        run: |
+          JOB_NAME="${{ steps.kaniko.outputs.job_name }}"
+          NAMESPACE="${{ steps.kaniko.outputs.namespace }}"
+          [ -z "${JOB_NAME}" ] && exit 0
+
+          POD=$(kubectl get pods -n "${NAMESPACE}" \
+            -l "job-name=${JOB_NAME}" -o name 2>/dev/null | head -1)
+          if [ -z "${POD}" ]; then
+            echo "No pod found for job ${JOB_NAME}"
+            exit 0
+          fi
+
+          echo "=== clone log ==="
+          kubectl logs -n "${NAMESPACE}" "${POD}" -c clone --tail=30 2>/dev/null || true
+          echo "=== kaniko log ==="
+          kubectl logs -n "${NAMESPACE}" "${POD}" -c kaniko --tail=150 2>/dev/null || true
+          echo "=== pod events ==="
+          kubectl get events -n "${NAMESPACE}" \
+            --field-selector "involvedObject.name=${POD#pod/}" \
+            --sort-by='.lastTimestamp' 2>/dev/null | tail -20 || true
+
+      - name: Cleanup
+        if: always()
+        run: |
+          NAMESPACE="${{ steps.kaniko.outputs.namespace }}"
+          JOB_NAME="${{ steps.kaniko.outputs.job_name }}"
+          REGISTRY_SECRET="${{ steps.kaniko.outputs.registry_secret }}"
+          GIT_SECRET="${{ steps.kaniko.outputs.git_secret }}"
+          [ -z "${NAMESPACE}" ] && exit 0
+          [ -n "${JOB_NAME}" ] && \
+            kubectl delete job "${JOB_NAME}" -n "${NAMESPACE}" --ignore-not-found || true
+          [ -n "${REGISTRY_SECRET}" ] && \
+            kubectl delete secret "${REGISTRY_SECRET}" -n "${NAMESPACE}" --ignore-not-found || true
+          [ -n "${GIT_SECRET}" ] && \
+            kubectl delete secret "${GIT_SECRET}" -n "${NAMESPACE}" --ignore-not-found || true
+
+      - name: Update image tag in k8s manifest
+        if: steps.tags.outputs.skip != 'true'
+        env:
+          K8S_REPO_PAT: ${{ secrets.K8S_REPO_PAT }}
+        run: |
+          PATCH_TAG="${{ steps.tags.outputs.patch_tag }}"
+          git config --global credential.helper store
+          printf 'https://x-access-token:%s@github.com\n' "${K8S_REPO_PAT}" > ~/.git-credentials
+          git clone --depth=1 https://github.com/cryptomentor-de/k8s.git /tmp/k8s-repo
+          cd /tmp/k8s-repo
+          sed -i \
+            "s|image: rg.fr-par.scw.cloud/cryptomentor/pixelfed:.*|image: rg.fr-par.scw.cloud/cryptomentor/pixelfed:${PATCH_TAG}|g" \
+            apps/pixelfed/03-pixelfed.yaml
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add apps/pixelfed/03-pixelfed.yaml
+          git diff --staged --quiet || \
+            git commit -m "chore: Pixelfed patch image → ${PATCH_TAG}"
+          git push

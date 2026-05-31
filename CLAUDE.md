@@ -10,12 +10,17 @@ möglich sind statt manuellem Datei-Diff.
 - `origin` → `https://github.com/cryptomentor-de/pixelfed` (unser Fork)
 - `upstream` → `https://github.com/pixelfed/pixelfed` (Upstream)
 
-**Aktiver Patch-Branch:** `patches/v0.12.7` (5 Commits auf Upstream-Tag `v0.12.7`)
+**Aktiver Patch-Branch:** `patches/v0.12.7` (Commits auf Upstream-Tag `v0.12.7`)
 
-**Deployment:** Der Fork wird vom k8s-Repo (`~/code/k8s`) konsumiert:
-- CI klont den Patch-Branch in den kaniko-Build-Context
-- `docker/pixelfed/Dockerfile` kopiert alle gepatchten Dateien aus `pixelfed-fork/`
-- Deployment via ArgoCD → `apps/pixelfed/` im k8s-Repo
+**Build & Deployment:**
+- Push auf `patches/*` → `.github/workflows/build-patch.yaml` startet automatisch
+- Kaniko baut das Image mit `docker/Dockerfile` (Build-Context = dieses Repo-Root)
+- Nach erfolgreichem Build: `apps/pixelfed/03-pixelfed.yaml` im k8s-Repo wird per `K8S_REPO_PAT` aktualisiert
+- ArgoCD synct den neuen Image-Tag automatisch → Deployment
+
+**Required Secrets** (in `cryptomentor-de/pixelfed` → Settings → Secrets → Actions):
+- `SCW_SECRET_KEY` — Scaleway Registry Push
+- `K8S_REPO_PAT` — Manifest-Update + Fork-Clone im kaniko-Job
 
 ---
 
@@ -31,8 +36,8 @@ möglich sind statt manuellem Datei-Diff.
 | #6617 | `app/Jobs/VideoPipeline/VideoThumbnailToCloudPipeline.php` | Backfill von S3 lesen, lokales Thumbnail wiederverwenden |
 | #6617 | `app/Jobs/VideoPipeline/VideoHlsPipeline.php` | Video von S3 lesen statt lokal |
 
-**Statische Assets** (`default.jpg`, `default.png`, `no-preview.png`) liegen im k8s-Repo
-(`docker/pixelfed/`) — Binärdateien, kein Merge-Bedarf.
+**Statische Assets** (`default.jpg`, `default.png`, `no-preview.png`) liegen in `docker/`
+dieses Repos — Binärdateien, kein Merge-Bedarf beim Rebase.
 
 ---
 
@@ -48,9 +53,14 @@ git rebase v0.12.8   # Git zeigt Konflikte wo nötig → lösen
 
 # Neuen Branch pushen
 git push origin patches/v0.12.8
+# → Workflow erkennt: MANIFEST_BASE=v0.12.7 ≠ v0.12.8 → skip
+# → Ersten Build manuell starten: workflow_dispatch mit base_tag=v0.12.8 patch_tag=v0.12.8-p1
+# → Danach: Auto-Trigger bei jedem weiteren Push auf patches/v0.12.8
+```
 
-# k8s-Repo: ARG BASE_TAG=v0.12.8 in docker/pixelfed/Dockerfile anpassen
-# → Workflow triggern → neues Image gebaut
+**Lokaler Smoke-Test (vom Repo-Root):**
+```bash
+docker build --build-arg BASE_TAG=v0.12.7 -f docker/Dockerfile .
 ```
 
 **Checkliste beim Rebase:**
@@ -58,7 +68,7 @@ git push origin patches/v0.12.8
 - [ ] Konflikte in `ApiV1Controller.php` besonders prüfen (riesige Datei, aktiv entwickelt)
 - [ ] `VideoThumbnail.php` prüfen (komplex, Video-Pipeline ändert sich)
 - [ ] `Kernel.php` / `RestrictedAccess.php` prüfen (Middleware-Chain kann sich ändern)
-- [ ] Lokaler Docker-Build als Smoke-Test (siehe k8s-Repo Dockerfile-Kommentar)
+- [ ] `docker/Dockerfile` — `ARG BASE_TAG` auf neuen Upstream-Tag aktualisieren
 
 ---
 
