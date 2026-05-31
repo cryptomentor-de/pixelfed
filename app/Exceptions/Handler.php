@@ -71,7 +71,9 @@ class Handler extends ExceptionHandler
                     'message' => $exception->getMessage(),
                     'errors' => $exception->validator->getMessageBag(),
                 ],
-                method_exists($exception, 'getStatusCode') ? $exception->getStatusCode() : 500
+                // ValidationException has no getStatusCode() — use $exception->status (always 422).
+                // Pixelfed issue #6609 / k8s issue #35
+                method_exists($exception, 'getStatusCode') ? $exception->getStatusCode() : $exception->status
             );
         } elseif ($request->wantsJson()) {
             return response()->json(
