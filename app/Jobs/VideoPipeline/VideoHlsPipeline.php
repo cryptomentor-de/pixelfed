@@ -92,7 +92,9 @@ class VideoHlsPipeline implements ShouldBeUniqueUntilProcessing, ShouldQueue
         $mp4 = $media->media_path;
         $man = str_replace('.mp4', '.m3u8', $mp4);
 
-        FFMpeg::fromDisk('local')
+        // Videos are stored on cloud storage — read from the configured cloud disk
+        // rather than the local filesystem where the file does not exist.
+        FFMpeg::fromDisk(config('filesystems.cloud', 's3'))
             ->open($mp4)
             ->exportForHLS()
             ->setSegmentLength(16)

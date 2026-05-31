@@ -100,11 +100,18 @@ class VideoThumbnailToCloudPipeline implements ShouldBeUniqueUntilProcessing, Sh
             $i = count($path) - 1;
             $path[$i] = $t;
             $save = implode('/', $path);
-            $video = FFMpeg::open($base)
-                ->getFrameFromSeconds(1)
-                ->export()
-                ->toDisk('local')
-                ->save($save);
+
+            // Reuse the local thumbnail when VideoThumbnail already extracted it.
+            // For historical/backfill cases the file won't exist, so read the
+            // video from cloud storage and extract a new thumbnail locally.
+            if (! file_exists(storage_path('app/'.$save))) {
+                $video = FFMpeg::fromDisk(config('filesystems.cloud', 's3'))
+                    ->open($base)
+                    ->getFrameFromSeconds(1)
+                    ->export()
+                    ->toDisk('local')
+                    ->save($save);
+            }
 
             if (! $save) {
                 return;

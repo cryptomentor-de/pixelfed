@@ -77,7 +77,7 @@ class VideoThumbnail implements ShouldBeUniqueUntilProcessing, ShouldQueue
     public function handle()
     {
         $media = $this->media;
-        if ($media->mime != 'video/mp4') {
+        if (!in_array($media->mime, ['video/mp4', 'video/quicktime'])) {
             return;
         }
         $base = $media->media_path;
@@ -107,12 +107,50 @@ class VideoThumbnail implements ShouldBeUniqueUntilProcessing, ShouldQueue
             if (config('media.hls.enabled')) {
                 VideoHlsPipeline::dispatch($media)->onQueue('mmo');
             }
+
+            // Upload thumbnail to S3 and set thumbnail_url when cloud storage is active.
+            // VideoThumbnail only saves to local disk; VideoThumbnailToCloudPipeline
+            // handles the S3 upload and will reuse the local copy without re-extracting.
+            if ((bool) config_cache('pixelfed.cloud_storage')) {
+                VideoThumbnailToCloudPipeline::dispatch($media)->onQueue('mmo');
+            }
         } catch (\Exception $e) {
             if (config('app.dev_log')) {
                 Log::error('Video thumbnail generation failed: '.$e->getMessage());
             }
 
             throw $e;
+        }
+
+        // Re-mux with faststart before S3 upload.
+        // Moves moov atom to front of file so iOS can begin playback without
+        // downloading the entire video first (progressive streaming).
+        // For video/quicktime (iOS uploads): also converts MOV container → MP4 and
+        // renames the local file + DB record so MediaStoragePipeline uploads with
+        // correct container and mime type.
+        try {
+            $videoPath = storage_path('app/'.$base);
+            if (file_exists($videoPath)) {
+                $tmpPath = $videoPath.'.remux.mp4';
+                $ffmpegBin = config('laravel-ffmpeg.ffmpeg.binaries', '/usr/bin/ffmpeg');
+                shell_exec(escapeshellarg($ffmpegBin).' -i '.escapeshellarg($videoPath)
+                    .' -c copy -movflags +faststart '.escapeshellarg($tmpPath).' 2>/dev/null');
+                if (file_exists($tmpPath) && filesize($tmpPath) > 1024) {
+                    rename($tmpPath, $videoPath);
+                    if ($media->mime === 'video/quicktime') {
+                        $mp4Path = preg_replace('/\.[^.]+$/', '.mp4', $videoPath);
+                        if (rename($videoPath, $mp4Path)) {
+                            $media->media_path = preg_replace('/\.[^.]+$/', '.mp4', $base);
+                            $media->mime = 'video/mp4';
+                            $media->save();
+                        }
+                    }
+                } else {
+                    @unlink($tmpPath);
+                }
+            }
+        } catch (\Exception $e) {
+            // non-fatal — original file will be uploaded without faststart
         }
 
         if ($media->status_id) {
