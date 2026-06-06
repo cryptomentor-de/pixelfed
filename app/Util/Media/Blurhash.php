@@ -37,6 +37,31 @@ class Blurhash
         $width = imagesx($image);
         $height = imagesy($image);
 
+        // Blurhash 4×4 DCT components need no more than ~32px per axis.
+        // Without this cap a 1920×1080 frame requires ~1.1 GB PHP heap (2M pixels
+        // × 272 bytes array overhead, doubled by the linear-color encoder), which
+        // exceeds the default memory_limit and causes a fatal PHP error on HD video.
+        $maxDim = 100;
+        if ($width > $maxDim || $height > $maxDim) {
+            $ratio = min($maxDim / $width, $maxDim / $height);
+            $newWidth = max(1, (int) round($width * $ratio));
+            $newHeight = max(1, (int) round($height * $ratio));
+            $resized = imagecreatetruecolor($newWidth, $newHeight);
+            if ($resized === false) {
+                imagedestroy($image);
+                return self::DEFAULT_HASH;
+            }
+            if (! imagecopyresampled($resized, $image, 0, 0, 0, 0, $newWidth, $newHeight, $width, $height)) {
+                imagedestroy($resized);
+                imagedestroy($image);
+                return self::DEFAULT_HASH;
+            }
+            imagedestroy($image);
+            $image = $resized;
+            $width = $newWidth;
+            $height = $newHeight;
+        }
+
         $pixels = [];
         for ($y = 0; $y < $height; $y++) {
             $row = [];
