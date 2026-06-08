@@ -16,7 +16,7 @@ on:
 
 jobs:
   build:
-    runs-on: arc-runner-set-k8s
+    runs-on: arc-runner-set-pixelfed
     permissions:
       contents: read
 
