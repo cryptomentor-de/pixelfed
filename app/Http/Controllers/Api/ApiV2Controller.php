@@ -261,7 +261,18 @@ class ApiV2Controller extends Controller
         }
 
         $storagePath = MediaPathService::get($user, 2);
-        $path = $photo->storePublicly($storagePath);
+        try {
+            $path = $photo->storePublicly($storagePath);
+        } catch (\Exception $e) {
+            \Log::error('[mediaUploadV2] storePublicly failed', [
+                'exception_class' => get_class($e),
+                'message' => $e->getMessage(),
+                'user_id' => $user->id,
+                'mime' => $photo->getMimeType(),
+                'size_kb' => $sizeInKbs,
+            ]);
+            throw $e;
+        }
         $hash = \hash_file('sha256', $photo);
         $license = null;
         $mime = $photo->getMimeType();
